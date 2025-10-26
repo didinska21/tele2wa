@@ -38,13 +38,11 @@ BASE_DIR = "stickers"
 os.makedirs(BASE_DIR, exist_ok=True)
 
 # Timeout global utk request ke Telegram
-tg_timeout = aiohttp.ClientTimeout(
-    total=600,         # total 10 menit
-    connect=30,
-    sock_connect=30,
-    sock_read=300
-)
-bot_session = AiohttpSession(timeout=tg_timeout)
+# timeout (detik) untuk sesi Bot (polling) — cukup angka
+bot_session = AiohttpSession(timeout=600)
+
+# timeout detail (ClientTimeout) tetap dipakai khusus untuk download pack (aiohttp.ClientSession)
+tg_timeout = aiohttp.ClientTimeout(total=600, connect=30, sock_connect=30, sock_read=300)
 
 bot = Bot(
     token=TOKEN,
