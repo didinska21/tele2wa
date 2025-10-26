@@ -14,6 +14,7 @@ from typing import List, Tuple, Callable, Awaitable
 import logging
 logging.basicConfig(level=logging.INFO)  # log ke VPS/terminal
 
+import asyncio
 import aiohttp
 from PIL import Image
 from dotenv import load_dotenv
@@ -23,6 +24,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 
 # ============================================================
 # CONFIG & INIT
@@ -35,7 +37,20 @@ if not TOKEN:
 BASE_DIR = "stickers"
 os.makedirs(BASE_DIR, exist_ok=True)
 
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+# Timeout global utk request ke Telegram
+tg_timeout = aiohttp.ClientTimeout(
+    total=600,         # total 10 menit
+    connect=30,
+    sock_connect=30,
+    sock_read=300
+)
+bot_session = AiohttpSession(timeout=tg_timeout)
+
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
+    session=bot_session
+)
 dp = Dispatcher()
 router = Router()
 
@@ -110,20 +125,49 @@ class DualProgress:
         await self._update(current, done=False)
 
     def tick(self, current: int):
-        import asyncio
         asyncio.get_running_loop().create_task(self._update(current, done=False))
 
     async def done_async(self, extra: str = ""):
         await self._update(self.total, done=True, extra=extra)
-        print()  # newline
+        print()
 
     def done(self, extra: str = ""):
-        import asyncio
         asyncio.get_running_loop().create_task(self._update(self.total, done=True, extra=extra))
 
 # ============================================================
-# HELPERS
+# HTTP helpers (retry/backoff)
 # ============================================================
+
+async def _retry_fetch_json(session, url, retries=3, backoff=1.6):
+    last = None
+    for i in range(retries):
+        try:
+            async with session.get(url) as resp:
+                if resp.status in (429, 500, 502, 503, 504):
+                    raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                return await resp.json()
+        except Exception as e:
+            last = e
+            await asyncio.sleep(backoff ** i)
+    raise last
+
+async def _retry_fetch_bytes(session, url, retries=3, backoff=1.6):
+    last = None
+    for i in range(retries):
+        try:
+            async with session.get(url) as resp:
+                if resp.status in (429, 500, 502, 503, 504):
+                    raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                return await resp.read()
+        except Exception as e:
+            last = e
+            await asyncio.sleep(backoff ** i)
+    raise last
+
+# ============================================================
+# TELEGRAM API helpers
+# ============================================================
+
 LINK_RE = re.compile(r"addstickers/([A-Za-z0-9_]+)")
 
 def extract_pack_name(link: str) -> str:
@@ -133,28 +177,32 @@ def extract_pack_name(link: str) -> str:
     return m.group(1)
 
 async def tg_get_sticker_set(session: aiohttp.ClientSession, bot_token: str, pack_name: str) -> dict:
-    async with session.get(f"https://api.telegram.org/bot{bot_token}/getStickerSet?name={pack_name}") as resp:
-        data = await resp.json()
-        if not data.get("ok"):
-            raise ValueError("Gagal ambil pack: " + str(data))
-        return data["result"]
+    url = f"https://api.telegram.org/bot{bot_token}/getStickerSet?name={pack_name}"
+    return (await _retry_fetch_json(session, url))["result"]
 
 async def tg_get_file_path(session: aiohttp.ClientSession, bot_token: str, file_id: str) -> str:
-    async with session.get(f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}") as r2:
-        info = await r2.json()
-        return info["result"]["file_path"]
+    url = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}"
+    return (await _retry_fetch_json(session, url))["result"]["file_path"]
 
 async def tg_download(session: aiohttp.ClientSession, bot_token: str, file_path: str) -> bytes:
-    async with session.get(f"https://api.telegram.org/file/bot{bot_token}/{file_path}") as r3:
-        return await r3.read()
+    url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
+    return await _retry_fetch_bytes(session, url)
+
+# ============================================================
+# DOWNLOAD (parallel + limited)
+# ============================================================
 
 async def download_pack(
     bot_token: str,
     pack_name: str,
     set_status_async: Callable[[str], Awaitable[None]]
 ) -> Tuple[List[str], str]:
-    """Unduh semua file pack. Simpan: .png (statis), .tgs / .webm (animasi)."""
-    async with aiohttp.ClientSession() as session:
+    """
+    Unduh semua file pack ke folder:
+      .png (statis), .tgs / .webm (animasi).
+    Paralel dengan semaphore (default 8).
+    """
+    async with aiohttp.ClientSession(timeout=tg_timeout) as session:
         result = await tg_get_sticker_set(session, bot_token, pack_name)
         stickers = result["stickers"]
         total = len(stickers)
@@ -166,69 +214,86 @@ async def download_pack(
             shutil.rmtree(folder)
         os.makedirs(folder, exist_ok=True)
 
-        file_list: List[str] = []
-        for i, s in enumerate(stickers, 1):
-            if s.get("is_animated"):
-                ext = "tgs"
-            elif s.get("is_video"):
-                ext = "webm"
-            else:
-                ext = "png"
+        sem = asyncio.Semaphore(8)
+        file_list: List[str] = [None] * total  # type: ignore
 
-            file_path = await tg_get_file_path(session, bot_token, s["file_id"])
-            data = await tg_download(session, bot_token, file_path)
+        async def worker(idx: int, s: dict):
+            async with sem:
+                if s.get("is_animated"):
+                    ext = "tgs"
+                elif s.get("is_video"):
+                    ext = "webm"
+                else:
+                    ext = "png"
+                fp = await tg_get_file_path(session, bot_token, s["file_id"])
+                data = await tg_download(session, bot_token, fp)
+                out_path = os.path.join(folder, f"{idx:03d}.{ext}")
+                with open(out_path, "wb") as f:
+                    f.write(data)
+                file_list[idx] = out_path
+                await prog.tick_async(sum(1 for x in file_list if x))
 
-            out_path = os.path.join(folder, f"{len(file_list):03d}.{ext}")
-            with open(out_path, "wb") as f:
-                f.write(data)
-            file_list.append(out_path)
-            await prog.tick_async(i)
+        await asyncio.gather(*(worker(i, s) for i, s in enumerate(stickers)))
+        files = [x for x in file_list if x]  # remove None
+        await prog.done_async(f"Total file: *{len(files)}*")
+        return files, folder
 
-        await prog.done_async(f"Total file: *{len(file_list)}*")
-        return file_list, folder
+# ============================================================
+# CONVERT (run in thread to avoid blocking loop)
+# ============================================================
 
 def _have(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
-def convert_static(folder: str, set_status_async: Callable[[str], Awaitable[None]]) -> Tuple[List[str], str]:
-    """PNG/WEBP → WEBP 512x512 (transparansi dijaga)."""
-    names = [n for n in sorted(os.listdir(folder)) if (n.endswith(".png") or n.endswith(".webp"))]
-    prog = DualProgress("⚙️ Konversi gambar ke WEBP …", len(names) or 1, set_status_async, "Convert")
+def _convert_static_blocking(folder: str) -> Tuple[List[str], str]:
+    names = [n for n in sorted(os.listdir(folder)) if n.endswith((".png",".webp"))]
     out_dir = os.path.join(folder, "converted_static")
     os.makedirs(out_dir, exist_ok=True)
-
-    converted: List[str] = []
-    for i, name in enumerate(names, 1):
+    out: List[str] = []
+    for name in names:
         src = os.path.join(folder, name)
         img = Image.open(src).convert("RGBA")
         img.thumbnail((512, 512))
         dst = os.path.join(out_dir, os.path.splitext(name)[0] + ".webp")
         img.save(dst, "WEBP", quality=90)
-        converted.append(dst)
-        prog.tick(i)
+        out.append(dst)
+    return out, out_dir
 
-    prog.done(f"Total dikonversi: *{len(converted)}*")
-    return converted, out_dir
+async def convert_static(folder: str, set_status_async: Callable[[str], Awaitable[None]]) -> Tuple[List[str], str]:
+    names = [n for n in sorted(os.listdir(folder)) if n.endswith((".png",".webp"))]
+    prog = DualProgress("⚙️ Konversi gambar ke WEBP …", len(names) or 1, set_status_async, "Convert")
 
-def convert_animated(folder: str, set_status_async: Callable[[str], Awaitable[None]]) -> Tuple[List[str], str]:
-    """
-    .tgs → frames (rlottie-convert) → img2webp → animated .webp
-    .webm → ffmpeg → animated .webp
-    """
-    missing = []
-    if not _have("ffmpeg"): missing.append("ffmpeg")
-    if not _have("img2webp"): missing.append("img2webp (paket webp)")
-    if missing:
+    def _run_with_progress() -> Tuple[List[str], str]:
+        out_dir = os.path.join(folder, "converted_static")
+        os.makedirs(out_dir, exist_ok=True)
+        out: List[str] = []
+        for i, name in enumerate(names, 1):
+            src = os.path.join(folder, name)
+            img = Image.open(src).convert("RGBA")
+            img.thumbnail((512, 512))
+            dst = os.path.join(out_dir, os.path.splitext(name)[0] + ".webp")
+            img.save(dst, "WEBP", quality=90)
+            out.append(dst)
+            prog.tick(i)  # schedule async update
+        return out, out_dir
+
+    files, out_dir = await asyncio.to_thread(_run_with_progress)
+    await prog.done_async(f"Total dikonversi: *{len(files)}*")
+    return files, out_dir
+
+def _convert_animated_blocking(folder: str) -> Tuple[List[str], str]:
+    if not _have("ffmpeg") or not _have("img2webp"):
+        missing = []
+        if not _have("ffmpeg"): missing.append("ffmpeg")
+        if not _have("img2webp"): missing.append("img2webp (paket webp)")
         raise RuntimeError(f"Tool eksternal belum terpasang: {', '.join(missing)}")
-
-    names = sorted(os.listdir(folder))
-    prog = DualProgress("⚙️ Konversi animasi ke WEBP …", len(names) or 1, set_status_async, "Convert")
 
     out_dir = os.path.join(folder, "converted_anim")
     os.makedirs(out_dir, exist_ok=True)
 
-    converted: List[str] = []
-    for i, file in enumerate(names, 1):
+    names = sorted(os.listdir(folder))
+    out: List[str] = []
+    for file in names:
         src = os.path.join(folder, file)
         name, ext = os.path.splitext(file)
         dst = os.path.join(out_dir, f"{name}.webp")
@@ -249,7 +314,6 @@ def convert_animated(folder: str, set_status_async: Callable[[str], Awaitable[No
                             ["img2webp", "-loop", "0", "-lossy", "-q", "80", "-o", dst, *frame_files],
                             check=True
                         )
-
             elif ext == ".webm":
                 subprocess.run([
                     "ffmpeg", "-y", "-i", src,
@@ -259,14 +323,30 @@ def convert_animated(folder: str, set_status_async: Callable[[str], Awaitable[No
                 ], check=True)
 
             if os.path.exists(dst):
-                converted.append(dst)
+                out.append(dst)
         except Exception as e:
             logging.warning("Gagal konversi animasi %s: %s", file, e)
 
-        prog.tick(i)
+    return out, out_dir
 
-    prog.done(f"Total animasi: *{len(converted)}*")
-    return converted, out_dir
+async def convert_animated(folder: str, set_status_async: Callable[[str], Awaitable[None]]) -> Tuple[List[str], str]:
+    names = sorted(os.listdir(folder))
+    prog = DualProgress("⚙️ Konversi animasi ke WEBP …", len(names) or 1, set_status_async, "Convert")
+
+    def _run_with_progress() -> Tuple[List[str], str]:
+        files, out_dir = _convert_animated_blocking(folder)
+        # progress kasar: asumsi 1 file = 1 unit
+        for i in range(1, max(1, len(names)) + 1):
+            prog.tick(i)
+        return files, out_dir
+
+    files, out_dir = await asyncio.to_thread(_run_with_progress)
+    await prog.done_async(f"Total animasi: *{len(files)}*")
+    return files, out_dir
+
+# ============================================================
+# PACKING & SENDING
+# ============================================================
 
 def chunk_by_30(files: List[str]) -> List[List[str]]:
     """Potong list menjadi potongan 30 (pack WhatsApp)."""
@@ -277,7 +357,7 @@ def build_pack_zip(packname: str, pack_index: int, files: List[str]) -> io.Bytes
     ZIP siap “dibagikan ke Sticker Maker”.
     (root ZIP, tanpa subfolder)
       author.txt     -> nama pack
-      title.txt      -> nama pack
+      title.txt      -> nama pack + info pack
       icon.png       -> dari stiker #1 (96x96)
       sticker_0.webp ... sticker_{N-1}.webp
     """
@@ -302,6 +382,18 @@ def build_pack_zip(packname: str, pack_index: int, files: List[str]) -> io.Bytes
 
     buf.seek(0)
     return buf
+
+def _zip_size(buf: io.BytesIO) -> int:
+    pos = buf.tell()
+    buf.seek(0, os.SEEK_END)
+    size = buf.tell()
+    buf.seek(pos)
+    return size
+
+async def send_zip_safely(message: types.Message, filename: str, buf: io.BytesIO):
+    """Kirim ZIP + jeda kecil agar tidak rate-limit."""
+    await message.answer_document(BufferedInputFile(buf.read(), filename=filename))
+    await asyncio.sleep(0.7)
 
 # ============================================================
 # COMMANDS (v3 Router)
@@ -357,9 +449,9 @@ async def handle_link(message: types.Message):
 
         # === KONVERSI ===
         if mode == "static":
-            converted, _ = convert_static(folder, set_status)
+            converted, _ = await convert_static(folder, set_status)
         else:
-            converted, _ = convert_animated(folder, set_status)
+            converted, _ = await convert_animated(folder, set_status)
 
         if not converted:
             await set_status("⚠️ Tidak ada file yang bisa dikonversi pada pack ini.")
@@ -367,23 +459,29 @@ async def handle_link(message: types.Message):
             return
 
         # === PACKING ===
-        packs = chunk_by_30(converted)  # akan menjadi N pack berisi 30 kecuali terakhir
+        packs = chunk_by_30(converted)  # akan menjadi N pack berisi 30, sisanya pack terakhir
         total_packs = len(packs)
         prog_pk = DualProgress("📦 Menyusun ZIP pack …", total_packs, set_status, "Packing")
 
         for idx, pack_files in enumerate(packs, 1):
-            zip_buf = build_pack_zip(pack, idx, pack_files)
-            fname = f"{pack}_pack{idx:02d}.zip"
-            await message.answer_document(
-                BufferedInputFile(zip_buf.read(), filename=fname),
-                caption=f"📦 {pack} — Pack {idx}/{total_packs}\n"
-                        f"Format: author.txt, title.txt, icon.png, sticker_0.webp..sticker_{len(pack_files)-1}.webp\n"
-                        f"👉 ZIP bisa *dibagikan langsung ke Sticker Maker* atau diekstrak & impor."
-            )
+            zip_buf = await asyncio.to_thread(build_pack_zip, pack, idx, pack_files)
+
+            # ukuran aman (Telegram bot limit dokumen ~50MB)
+            size = _zip_size(zip_buf)
+            if size > 48 * 1024 * 1024 and len(pack_files) > 15:
+                # fallback: pecah dua
+                half = len(pack_files) // 2
+                partA = await asyncio.to_thread(build_pack_zip, f"{pack}_A", idx, pack_files[:half])
+                partB = await asyncio.to_thread(build_pack_zip, f"{pack}_B", idx, pack_files[half:])
+                await send_zip_safely(message, f"{pack}_pack{idx:02d}_A.zip", partA)
+                await send_zip_safely(message, f"{pack}_pack{idx:02d}_B.zip", partB)
+            else:
+                await send_zip_safely(message, f"{pack}_pack{idx:02d}.zip", zip_buf)
+
             await prog_pk.tick_async(idx)
 
         await prog_pk.done_async()
-        await message.answer("🎉 Beres! Semua pack terkirim. Selamat dipakai di WhatsApp.")
+        await message.answer("🎉 Beres! Semua pack terkirim. ZIP bisa *dibagikan langsung ke Sticker Maker* atau diekstrak & diimpor.")
     except RuntimeError as e:
         await set_status(f"❌ {e}")
     except Exception as e:
@@ -394,7 +492,6 @@ async def handle_link(message: types.Message):
 # ============================================================
 # RUN (v3 style)
 # ============================================================
-import asyncio
 
 async def main():
     print("🤖 Bot konversi stiker Telegram → WhatsApp aktif.")
