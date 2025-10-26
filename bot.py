@@ -6,17 +6,18 @@ import re
 import io
 import math
 import zipfile
-import asyncio
-import aiohttp
-import subprocess
 import shutil
-from typing import List, Tuple, Optional
+import subprocess
+from typing import List, Tuple
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import InputFile
-from aiogram.utils import executor
+import aiohttp
 from PIL import Image
 from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, Router, types
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import BufferedInputFile
 
 # ============================================================
 # CONFIG & INIT
@@ -29,11 +30,12 @@ if not TOKEN:
 BASE_DIR = "stickers"
 os.makedirs(BASE_DIR, exist_ok=True)
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
+bot = Bot(token=TOKEN, parse_mode=ParseMode.MARKDOWN)
+dp = Dispatcher()
+router = Router()
 
-# State sederhana: user_id -> mode ("static" | "anim")
-USER_MODE = {}
+# Simpel state: user_id -> mode ("static" | "anim")
+USER_MODE: dict[int, str] = {}
 
 # ============================================================
 # HELPERS
@@ -47,8 +49,7 @@ def extract_pack_name(link: str) -> str:
     return m.group(1)
 
 async def tg_get_sticker_set(session: aiohttp.ClientSession, bot_token: str, pack_name: str) -> dict:
-    url = f"https://api.telegram.org/bot{bot_token}/getStickerSet?name={pack_name}"
-    async with session.get(url) as resp:
+    async with session.get(f"https://api.telegram.org/bot{bot_token}/getStickerSet?name={pack_name}") as resp:
         data = await resp.json()
         if not data.get("ok"):
             raise ValueError("Gagal ambil pack: " + str(data))
@@ -60,11 +61,10 @@ async def tg_get_file_path(session: aiohttp.ClientSession, bot_token: str, file_
         return info["result"]["file_path"]
 
 async def tg_download(session: aiohttp.ClientSession, bot_token: str, file_path: str) -> bytes:
-    file_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
-    async with session.get(file_url) as r3:
+    async with session.get(f"https://api.telegram.org/file/bot{bot_token}/{file_path}") as r3:
         return await r3.read()
 
-async def download_pack(bot_token: str, pack_name: str) -> Tuple[List[str], str]:
+async def download_pack(bot_token: str, pack_name: str) -> tuple[List[str], str]:
     """Unduh semua file pack. Simpan: .png (statis), .tgs / .webm (animasi)."""
     async with aiohttp.ClientSession() as session:
         result = await tg_get_sticker_set(session, bot_token, pack_name)
@@ -75,7 +75,7 @@ async def download_pack(bot_token: str, pack_name: str) -> Tuple[List[str], str]
             shutil.rmtree(folder)
         os.makedirs(folder, exist_ok=True)
 
-        file_list = []
+        file_list: List[str] = []
         for s in stickers:
             if s.get("is_animated"):
                 ext = "tgs"
@@ -84,8 +84,7 @@ async def download_pack(bot_token: str, pack_name: str) -> Tuple[List[str], str]
             else:
                 ext = "png"
 
-            file_id = s["file_id"]
-            file_path = await tg_get_file_path(session, bot_token, file_id)
+            file_path = await tg_get_file_path(session, bot_token, s["file_id"])
             data = await tg_download(session, bot_token, file_path)
 
             out_path = os.path.join(folder, f"{len(file_list):03d}.{ext}")
@@ -95,12 +94,12 @@ async def download_pack(bot_token: str, pack_name: str) -> Tuple[List[str], str]
 
         return file_list, folder
 
-def convert_static(folder: str) -> Tuple[List[str], str]:
+def convert_static(folder: str) -> tuple[List[str], str]:
     """PNG/WEBP → WEBP 512x512 (transparansi dijaga)."""
     out_dir = os.path.join(folder, "converted_static")
     os.makedirs(out_dir, exist_ok=True)
 
-    converted = []
+    converted: List[str] = []
     for name in sorted(os.listdir(folder)):
         if not (name.endswith(".png") or name.endswith(".webp")):
             continue
@@ -112,10 +111,10 @@ def convert_static(folder: str) -> Tuple[List[str], str]:
         converted.append(dst)
     return converted, out_dir
 
-def have(cmd: str) -> bool:
+def _have(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
-def convert_animated(folder: str) -> Tuple[List[str], str]:
+def convert_animated(folder: str) -> tuple[List[str], str]:
     """
     .tgs → frames (rlottie-convert) → img2webp → animated .webp
     .webm → ffmpeg → animated .webp
@@ -123,16 +122,14 @@ def convert_animated(folder: str) -> Tuple[List[str], str]:
     out_dir = os.path.join(folder, "converted_anim")
     os.makedirs(out_dir, exist_ok=True)
 
-    need_tools = []
-    if not have("ffmpeg"): need_tools.append("ffmpeg")
-    if not have("img2webp"): need_tools.append("img2webp (libwebp)")
-    if not have("rlottie-convert"): need_tools.append("rlottie-convert (untuk .tgs)")
-    # kita toleransi: kalau tidak ada rlottie-convert, .tgs akan diskip; tapi .webm tetap bisa
-    if not have("ffmpeg") or not have("img2webp"):
-        missing = ", ".join(need_tools)
-        raise RuntimeError(f"Tool eksternal belum terpasang: {missing}")
+    # Wajib untuk animasi:
+    missing = []
+    if not _have("ffmpeg"): missing.append("ffmpeg")
+    if not _have("img2webp"): missing.append("img2webp (paket webp)")
+    if missing:
+        raise RuntimeError(f"Tool eksternal belum terpasang: {', '.join(missing)}")
 
-    converted = []
+    converted: List[str] = []
     for file in sorted(os.listdir(folder)):
         src = os.path.join(folder, file)
         name, ext = os.path.splitext(file)
@@ -140,18 +137,22 @@ def convert_animated(folder: str) -> Tuple[List[str], str]:
 
         try:
             if ext == ".tgs":
-                if not have("rlottie-convert"):
+                if not _have("rlottie-convert"):
+                    # tidak fatal: skip .tgs jika tool tidak ada
                     print(f"skip .tgs (rlottie-convert tidak ada): {file}")
                     continue
                 frames = os.path.join(out_dir, f"{name}_frames")
                 os.makedirs(frames, exist_ok=True)
                 subprocess.run(["rlottie-convert", src, os.path.join(frames, "%03d.png")], check=True)
-                frame_files = sorted([os.path.join(frames, f) for f in os.listdir(frames) if f.endswith(".png")])
+                frame_files = sorted(
+                    [os.path.join(frames, f) for f in os.listdir(frames) if f.endswith(".png")]
+                )
                 if not frame_files:
                     continue
-                subprocess.run([
-                    "img2webp", "-loop", "0", "-lossy", "-q", "80", "-o", dst, *frame_files
-                ], check=True)
+                subprocess.run(
+                    ["img2webp", "-loop", "0", "-lossy", "-q", "80", "-o", dst, *frame_files],
+                    check=True
+                )
 
             elif ext == ".webm":
                 subprocess.run([
@@ -160,7 +161,6 @@ def convert_animated(folder: str) -> Tuple[List[str], str]:
                            "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
                     "-loop", "0", dst
                 ], check=True)
-
             else:
                 continue
 
@@ -173,12 +173,12 @@ def convert_animated(folder: str) -> Tuple[List[str], str]:
 
     return converted, out_dir
 
-def split_two_equal(files: List[str]) -> Tuple[List[str], List[str]]:
-    """Bagi dua sama rata (contoh: 36 → 18+18, 40 → 20+20)."""
+def split_two_equal(files: List[str]) -> tuple[List[str], List[str]]:
+    """Bagi dua sama rata (36→18+18, 40→20+20)."""
     half = len(files) // 2
     return files[:half], files[half:]
 
-def to_zip(files: List[str], zip_name: str) -> io.BytesIO:
+def to_zip(files: List[str]) -> io.BytesIO:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in files:
@@ -187,7 +187,7 @@ def to_zip(files: List[str], zip_name: str) -> io.BytesIO:
     return buf
 
 # ============================================================
-# COMMANDS & FLOW
+# COMMANDS (v3 Router)
 # ============================================================
 WELCOME = (
     "👋 *Selamat datang di Bot Konversi Stiker Telegram → WhatsApp!*\n\n"
@@ -199,25 +199,25 @@ WELCOME = (
     "`https://t.me/addstickers/leonardicaprio`"
 )
 
-@dp.message_handler(commands=["start", "help"])
+@router.message(Command("start", "help"))
 async def cmd_start(message: types.Message):
-    await message.answer(WELCOME, parse_mode="Markdown")
+    await message.answer(WELCOME)
 
-@dp.message_handler(commands=["stikerbiasa"])
+@router.message(Command("stikerbiasa"))
 async def cmd_static(message: types.Message):
     USER_MODE[message.from_user.id] = "static"
-    await message.answer("🖼 Mode *stiker biasa* aktif.\nKirim link pack Telegram-nya ya 🙂", parse_mode="Markdown")
+    await message.answer("🖼 Mode *stiker biasa* aktif.\nKirim link pack Telegram-nya ya 🙂")
 
-@dp.message_handler(commands=["stikeranimasi"])
+@router.message(Command("stikeranimasi"))
 async def cmd_anim(message: types.Message):
     USER_MODE[message.from_user.id] = "anim"
-    await message.answer("🎞 Mode *stiker animasi* aktif.\nKirim link pack Telegram-nya ya 🙂", parse_mode="Markdown")
+    await message.answer("🎞 Mode *stiker animasi* aktif.\nKirim link pack Telegram-nya ya 🙂")
 
-@dp.message_handler(content_types=types.ContentType.TEXT)
+@router.message()  # terima link setelah user pilih mode
 async def handle_link(message: types.Message):
     mode = USER_MODE.get(message.from_user.id)
     if mode not in ("static", "anim"):
-        return  # abaikan chat bebas; user belum pilih mode
+        return
 
     # validasi link
     try:
@@ -226,10 +226,9 @@ async def handle_link(message: types.Message):
         await message.reply(str(e))
         return
 
-    status = await message.answer(f"🔎 Memeriksa link *{pack}* ...", parse_mode="Markdown")
+    status = await message.answer(f"🔎 Memeriksa link *{pack}* ...")
 
     try:
-        # unduh semua file
         await status.edit_text("⬇️ Mengunduh stiker dari Telegram ...")
         files, folder = await download_pack(TOKEN, pack)
 
@@ -237,8 +236,7 @@ async def handle_link(message: types.Message):
             await status.edit_text("⚙️ Mengonversi gambar ke WEBP 512×512 ...")
             converted, _ = convert_static(folder)
         else:
-            await status.edit_text("⚙️ Mengonversi animasi (TGS/WEBM) ke animated WEBP ...\n"
-                                   "⏳ Proses bisa agak lama.")
+            await status.edit_text("⚙️ Mengonversi animasi (TGS/WEBM) ke animated WEBP ...\n⏳ Mohon tunggu.")
             converted, _ = convert_animated(folder)
 
         if not converted:
@@ -249,16 +247,16 @@ async def handle_link(message: types.Message):
         await status.edit_text("📦 Menyiapkan ZIP ...")
 
         if len(converted) > 30:
-            a, b = split_two_equal(converted)  # bagi 2 sama rata
-            zip1 = to_zip(a, f"{pack}_part1.zip")
-            zip2 = to_zip(b, f"{pack}_part2.zip")
+            a, b = split_two_equal(converted)
+            zip1 = to_zip(a)
+            zip2 = to_zip(b)
             await status.edit_text("📦 Jumlah > 30 → dibagi menjadi *dua bagian sama rata*.")
-            await message.answer_document(InputFile(zip1, filename=f"{pack}_1.zip"))
-            await message.answer_document(InputFile(zip2, filename=f"{pack}_2.zip"))
+            await message.answer_document(BufferedInputFile(zip1.read(), filename=f"{pack}_1.zip"))
+            await message.answer_document(BufferedInputFile(zip2.read(), filename=f"{pack}_2.zip"))
         else:
-            zip_buf = to_zip(converted, f"{pack}.zip")
+            zip_buf = to_zip(converted)
             await status.edit_text("✅ Selesai! Mengirim ZIP ...")
-            await message.answer_document(InputFile(zip_buf, filename=f"{pack}.zip"))
+            await message.answer_document(BufferedInputFile(zip_buf.read(), filename=f"{pack}.zip"))
 
         await message.answer("🎉 Beres! Extract ZIP lalu impor ke WhatsApp dengan *Personal Stickers for WhatsApp*.")
     except RuntimeError as e:
@@ -269,8 +267,14 @@ async def handle_link(message: types.Message):
         USER_MODE.pop(message.from_user.id, None)
 
 # ============================================================
-# RUN
+# RUN (v3 style)
 # ============================================================
-if __name__ == "__main__":
+import asyncio
+
+async def main():
     print("🤖 Bot konversi stiker Telegram → WhatsApp aktif.")
-    executor.start_polling(dp, skip_updates=True)
+    dp.include_router(router)
+    await dp.start_polling(bot, skip_updates=True)
+
+if __name__ == "__main__":
+    asyncio.run(main())         
