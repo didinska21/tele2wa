@@ -30,7 +30,12 @@ if not TOKEN:
 BASE_DIR = "stickers"
 os.makedirs(BASE_DIR, exist_ok=True)
 
-bot = Bot(token=TOKEN, parse_mode=ParseMode.MARKDOWN)
+from aiogram.client.default import DefaultBotProperties
+
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
+)
 dp = Dispatcher()
 router = Router()
 
